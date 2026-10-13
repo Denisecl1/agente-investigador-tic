@@ -8,6 +8,7 @@ from flask import request
 from upstash_redis import Redis
 
 
+# Configuración del límite diario
 LIMITE_DIARIO = 2
 ZONA_HORARIA = ZoneInfo("America/Mexico_City")
 
@@ -18,7 +19,7 @@ MENSAJE_LIMITE = (
 
 
 def comprobar_limite_diario():
-    # Credenciales privadas de Upstash
+    # Obtener credenciales privadas de Upstash
     url = (
         os.getenv("KV_REST_API_URL")
         or os.getenv("STORAGE_KV_REST_API_URL")
@@ -34,28 +35,31 @@ def comprobar_limite_diario():
     if not url or not token:
         raise RuntimeError("Falta configurar Upstash Redis")
 
-    redis = Redis(url=url, token=token)
-
-    # Obtener la IP desde el proxy de Vercel
+    # Identificar la IP del visitante
     if os.getenv("VERCEL"):
-        ip = request.headers.get("x-vercel-forwarded-for", "")
-        ip = ip.split(",")[0].strip()
+        ip = (
+            request.headers.get("x-vercel-forwarded-for")
+            or request.headers.get("x-forwarded-for")
+            or ""
+        ).split(",")[0].strip()
     else:
         ip = request.remote_addr
 
     if not ip:
         raise RuntimeError("No se pudo identificar la IP")
 
-    # Obtener fecha y hora de México
+    # Fecha actual en México
     ahora = datetime.now(ZONA_HORARIA)
     fecha = ahora.strftime("%Y-%m-%d")
 
-    # Evitar guardar la IP directamente
-    ip_hash = hashlib.sha256(ip.encode()).hexdigest()
+    # Crear un identificador sin guardar la IP directamente
+    ip_hash = hashlib.sha256(
+        ip.encode("utf-8")
+    ).hexdigest()
 
     clave = f"radar_tic:limite:{fecha}:{ip_hash}"
 
-    # Calcular los segundos hasta mañana
+    # Calcular cuánto falta para medianoche
     manana = datetime.combine(
         ahora.date() + timedelta(days=1),
         time.min,
@@ -67,7 +71,10 @@ def comprobar_limite_diario():
         int((manana - ahora).total_seconds())
     )
 
-    # Incrementar y configurar expiración de forma atómica
+    # Conectar con Redis
+    redis = Redis(url=url, token=token)
+
+    # Incrementar contador y establecer expiración
     transaccion = redis.multi()
     transaccion.incr(clave)
     transaccion.expire(clave, segundos)
@@ -75,4 +82,7 @@ def comprobar_limite_diario():
     resultados = transaccion.exec()
     total = int(resultados[0])
 
-    return total <= LIMITE_DIARIO, segundos
+    # Permitir únicamente los primeros dos intentos
+    permitido = total <= LIMITE_DIARIO
+
+    return permitido, segundos
