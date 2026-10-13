@@ -4,7 +4,7 @@ from flask import Flask, Response, render_template, request, stream_with_context
 from openai import OpenAI
 
 from config import OPENAI_API_KEY, OPENAI_MODEL
-
+from limite_diario import comprobar_limite_diario, MENSAJE_LIMITE
 
 app = Flask(
     __name__,
@@ -91,6 +91,38 @@ def investigar():
             mimetype="text/event-stream",
             status=400
         )
+
+        
+    # Comprobar límite diario antes de llamar a OpenAI
+    try:
+        permitido, segundos_restantes = comprobar_limite_diario()
+
+    except Exception:
+        app.logger.exception("Error al verificar el límite diario")
+
+        return Response(
+            sse("error", {
+                "mensaje": (
+                    "No es posible verificar las peticiones "
+                    "disponibles. Intenta nuevamente más tarde."
+                )
+            }),
+            mimetype="text/event-stream",
+            status=503
+        )
+
+    if not permitido:
+        return Response(
+            sse("error", {
+                "mensaje": MENSAJE_LIMITE
+            }),
+            mimetype="text/event-stream",
+            status=429,
+            headers={
+                "Retry-After": str(segundos_restantes)
+            }
+        )
+
 
     instrucciones = """
 Eres un agente investigador especializado en tecnologías de información
