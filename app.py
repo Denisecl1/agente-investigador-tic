@@ -1,4 +1,7 @@
 import json
+import os
+from flask import jsonify
+from upstash_redis import Redis
 
 from flask import Flask, Response, render_template, request, stream_with_context
 from openai import OpenAI
@@ -16,6 +19,41 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Control de búsqueda web para los experimentos
 USAR_WEB_SEARCH = True
 
+
+# Comprobación temporal de Redis para Preview
+@app.get("/api/prueba-redis")
+def prueba_conexion_redis():
+
+    # Disponible únicamente en despliegues Preview
+    if os.getenv("VERCEL_ENV") != "preview":
+        return jsonify({"mensaje": "No disponible"}), 404
+
+    url = os.getenv("KV_REST_API_URL")
+    token = os.getenv("KV_REST_API_TOKEN")
+
+    if not url or not token:
+        return jsonify({
+            "redis": "Faltan variables de entorno"
+        }), 503
+
+    try:
+        redis = Redis(url=url, token=token)
+        respuesta = redis.ping()
+
+        if respuesta == "PONG":
+            return jsonify({
+                "redis": "Conectado correctamente"
+            }), 200
+
+        return jsonify({
+            "redis": "Respuesta inesperada"
+        }), 503
+
+    except Exception:
+        app.logger.exception("Error de conexion Redis")
+        return jsonify({
+            "redis": "Error de conexion"
+        }), 503
 
 @app.route("/")
 def inicio():
@@ -92,7 +130,6 @@ def investigar():
             status=400
         )
 
-        
     # Comprobar límite diario antes de llamar a OpenAI
     try:
         permitido, segundos_restantes = comprobar_limite_diario()
@@ -122,7 +159,6 @@ def investigar():
                 "Retry-After": str(segundos_restantes)
             }
         )
-
 
     instrucciones = """
 Eres un agente investigador especializado en tecnologías de información
