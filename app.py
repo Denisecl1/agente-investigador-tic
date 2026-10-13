@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from flask import jsonify
 from upstash_redis import Redis
 
@@ -21,8 +22,70 @@ USAR_WEB_SEARCH = True
 
 
 # Comprobación temporal de Redis para Preview
+
 @app.get("/api/prueba-redis")
 def prueba_conexion_redis():
+
+    # Solo disponible en Preview
+    if os.getenv("VERCEL_ENV") != "preview":
+        return jsonify({"mensaje": "No disponible"}), 404
+
+    url = os.getenv("KV_REST_API_URL")
+    token = os.getenv("KV_REST_API_TOKEN")
+
+    if not url or not token:
+        return jsonify({
+            "redis": "Faltan variables"
+        }), 503
+
+    redis = None
+    clave = f"radar_tic:prueba:{uuid.uuid4().hex}"
+
+    try:
+        redis = Redis(url=url, token=token)
+
+        # Simular tres incrementos reales en Redis
+        transaccion = redis.multi()
+        transaccion.incr(clave)
+        transaccion.expire(clave, 60)
+
+        resultado = transaccion.exec()
+
+        conteos = [
+            int(resultado[0]),
+            int(redis.incr(clave)),
+            int(redis.incr(clave))
+        ]
+
+        estados = [
+            "PERMITIDA" if n <= 2 else "BLOQUEADA"
+            for n in conteos
+        ]
+
+        return jsonify({
+            "redis": "Conectado correctamente",
+            "conteos": conteos,
+            "investigaciones": estados,
+            "openai": "No se utilizo"
+        }), 200
+
+    except Exception:
+        app.logger.exception("Error al probar Redis")
+
+        return jsonify({
+            "redis": "Error al probar el contador"
+        }), 503
+
+    finally:
+        # Borrar los datos temporales de la prueba
+        if redis is not None:
+            try:
+                redis.delete(clave)
+            except Exception:
+                app.logger.exception(
+                    "No se pudo limpiar la prueba"
+                )
+
 
     # Disponible únicamente en despliegues Preview
     if os.getenv("VERCEL_ENV") != "preview":
