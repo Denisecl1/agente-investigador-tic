@@ -1,27 +1,44 @@
+
 import json
 
-from flask import Flask, Response, render_template, request, stream_with_context
+from flask import (
+    Flask,
+    Response,
+    render_template,
+    request,
+    stream_with_context
+)
+
 from openai import OpenAI
 
 from config import OPENAI_API_KEY, OPENAI_MODEL
+from limite_diario import (
+    comprobar_limite_diario,
+    MENSAJE_LIMITE
+)
 
 
+# Crear aplicación Flask
 app = Flask(
     __name__,
     static_folder="assets",
     static_url_path="/assets"
 )
 
+# Cliente de OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
-# Control de búsqueda web para los experimentos
+
+# Activar la búsqueda web
 USAR_WEB_SEARCH = True
 
 
+# Página principal
 @app.route("/")
 def inicio():
     return render_template("index.html")
 
 
+# Crear eventos para la interfaz
 def sse(tipo, datos):
     return (
         f"event: {tipo}\n"
@@ -29,7 +46,9 @@ def sse(tipo, datos):
     )
 
 
+# Obtener valores de eventos de OpenAI
 def obtener_valor(objeto, atributo, valor_default=None):
+
     if objeto is None:
         return valor_default
 
@@ -39,17 +58,24 @@ def obtener_valor(objeto, atributo, valor_default=None):
     return getattr(objeto, atributo, valor_default)
 
 
+# Recuperar fuentes de Web Search
 def emitir_fuentes_desde_accion(accion, urls_emitidas):
+
     if accion is None:
         return []
 
     nuevas_fuentes = []
 
-    tipo_accion = obtener_valor(accion, "type", "")
+    tipo_accion = obtener_valor(
+        accion, "type", ""
+    )
 
-    url_directa = obtener_valor(accion, "url")
+    url_directa = obtener_valor(
+        accion, "url"
+    )
 
     if url_directa and url_directa not in urls_emitidas:
+
         urls_emitidas.add(url_directa)
 
         nuevas_fuentes.append({
@@ -58,12 +84,16 @@ def emitir_fuentes_desde_accion(accion, urls_emitidas):
             "origen": tipo_accion or "web_search"
         })
 
-    sources = obtener_valor(accion, "sources", []) or []
+    sources = obtener_valor(
+        accion, "sources", []
+    ) or []
 
     for source in sources:
+
         url = obtener_valor(source, "url")
 
         if url and url not in urls_emitidas:
+
             urls_emitidas.add(url)
 
             nuevas_fuentes.append({
@@ -75,22 +105,108 @@ def emitir_fuentes_desde_accion(accion, urls_emitidas):
     return nuevas_fuentes
 
 
+# Endpoint del agente investigador
 @app.route("/api/investigar", methods=["POST"])
 def investigar():
-    datos = request.get_json(silent=True) or {}
-    pregunta = datos.get("pregunta", "").strip()
 
+    # Obtener la pregunta
+    datos = request.get_json(silent=True)
+
+    if not isinstance(datos, dict):
+        datos = {}
+
+    pregunta = datos.get("pregunta", "")
+
+    if not isinstance(pregunta, str):
+        pregunta = ""
+
+    pregunta = pregunta.strip()
+
+    # Validar pregunta vacía
     if not pregunta:
+
         return Response(
             sse(
                 "error",
                 {
-                    "mensaje": "Debes escribir una pregunta de investigación."
+                    "mensaje":
+                    "Debes escribir una pregunta de investigación."
                 }
             ),
             mimetype="text/event-stream",
             status=400
         )
+
+    # Evitar preguntas demasiado largas
+    if len(pregunta) > 1000:
+
+        return Response(
+            sse(
+                "error",
+                {
+                    "mensaje":
+                    "La pregunta no puede superar los 1000 caracteres."
+                }
+            ),
+            mimetype="text/event-stream",
+            status=400
+        )
+
+    # =====================================
+    # PROTECCIÓN DEL LÍMITE DIARIO
+    # =====================================
+
+    try:
+
+        permitido, segundos_restantes = (
+            comprobar_limite_diario()
+        )
+
+    except Exception:
+
+        app.logger.exception(
+            "No se pudo verificar el límite diario"
+        )
+
+        # Si Redis falla, no consumir créditos de OpenAI
+        return Response(
+            sse(
+                "error",
+                {
+                    "mensaje":
+                    "No se pudo comprobar el límite disponible. "
+                    "Inténtalo nuevamente más tarde."
+                }
+            ),
+            mimetype="text/event-stream",
+            status=503,
+            headers={
+                "Cache-Control": "no-store"
+            }
+        )
+
+    # Bloquear al superar los dos intentos
+    if not permitido:
+
+        return Response(
+            sse(
+                "error",
+                {
+                    "mensaje": MENSAJE_LIMITE
+                }
+            ),
+            mimetype="text/event-stream",
+            status=429,
+            headers={
+                "Retry-After": str(segundos_restantes),
+                "Cache-Control": "no-store",
+                "X-Radar-Limit": "daily"
+            }
+        )
+
+    # =====================================
+    # INSTRUCCIONES DEL AGENTE
+    # =====================================
 
     instrucciones = """
 Eres un agente investigador especializado en tecnologías de información
@@ -190,7 +306,10 @@ Debes incluir al menos 3 filas cuando la pregunta lo permita.
 ## 7. Conclusiones
 [Conclusión final en 1 o 2 párrafos.]
 """
+
+    # Modo sin Web Search para experimentos
     if not USAR_WEB_SEARCH:
+
         instrucciones = """
 Eres un agente investigador especializado en TIC.
 
@@ -198,6 +317,7 @@ Responde utilizando únicamente los conocimientos
 del modelo, sin consultar Internet.
 
 No inventes fuentes, enlaces, búsquedas ni fechas.
+
 Aclara que la información no ha sido verificada
 mediante búsqueda web.
 
@@ -224,31 +344,39 @@ aclara que no es posible comparar fuentes
 verificadas sin acceso a búsqueda web.
 """
 
-
+    # =====================================
+    # GENERACIÓN DE INVESTIGACIÓN
+    # =====================================
 
     @stream_with_context
     def generar():
+
         urls_emitidas = set()
         reporte_acumulado = []
 
         try:
+
             yield sse(
                 "estado",
                 {
                     "etapa": "analizando",
-                    "mensaje": "Analizando la pregunta de investigación..."
+                    "mensaje":
+                    "Analizando la pregunta de investigación..."
                 }
             )
 
+            # Conexión con OpenAI Responses API
             stream = client.responses.create(
                 model=OPENAI_MODEL,
-               tools=[
-    {
-        "type": "web_search",
-        "search_context_size": "medium"
-    }
-] if USAR_WEB_SEARCH else [],
-                               input=[
+
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "medium"
+                    }
+                ] if USAR_WEB_SEARCH else [],
+
+                input=[
                     {
                         "role": "system",
                         "content": instrucciones
@@ -258,56 +386,88 @@ verificadas sin acceso a búsqueda web.
                         "content": pregunta
                     }
                 ],
+
                 stream=True
             )
 
+            # Procesar eventos de OpenAI
             for event in stream:
-                tipo = obtener_valor(event, "type", "")
+
+                tipo = obtener_valor(
+                    event, "type", ""
+                )
 
                 if tipo == "response.web_search_call.in_progress":
+
                     yield sse(
                         "estado",
                         {
                             "etapa": "busqueda",
-                            "mensaje": "Iniciando una búsqueda en Internet..."
+                            "mensaje":
+                            "Iniciando una búsqueda en Internet..."
                         }
                     )
 
                 elif tipo == "response.web_search_call.searching":
+
                     yield sse(
                         "estado",
                         {
                             "etapa": "busqueda",
-                            "mensaje": "Buscando, contrastando y consultando fuentes..."
+                            "mensaje":
+                            "Buscando, contrastando y consultando fuentes..."
                         }
                     )
 
                 elif tipo == "response.web_search_call.completed":
+
                     yield sse(
                         "estado",
                         {
                             "etapa": "revision",
-                            "mensaje": "Búsqueda completada. Revisando la información encontrada..."
+                            "mensaje":
+                            "Búsqueda completada. Revisando la información encontrada..."
                         }
                     )
 
                 elif tipo == "response.output_item.done":
-                    item = obtener_valor(event, "item")
 
-                    if obtener_valor(item, "type") == "web_search_call":
-                        accion = obtener_valor(item, "action")
+                    item = obtener_valor(
+                        event, "item"
+                    )
+
+                    if obtener_valor(
+                        item, "type"
+                    ) == "web_search_call":
+
+                        accion = obtener_valor(
+                            item, "action"
+                        )
 
                         for fuente in emitir_fuentes_desde_accion(
                             accion,
                             urls_emitidas
                         ):
-                            yield sse("fuente", fuente)
+
+                            yield sse(
+                                "fuente",
+                                fuente
+                            )
 
                 elif tipo == "response.output_text.annotation.added":
-                    anotacion = obtener_valor(event, "annotation")
 
-                    if obtener_valor(anotacion, "type") == "url_citation":
-                        url = obtener_valor(anotacion, "url")
+                    anotacion = obtener_valor(
+                        event, "annotation"
+                    )
+
+                    if obtener_valor(
+                        anotacion, "type"
+                    ) == "url_citation":
+
+                        url = obtener_valor(
+                            anotacion, "url"
+                        )
+
                         titulo = obtener_valor(
                             anotacion,
                             "title",
@@ -315,6 +475,7 @@ verificadas sin acceso a búsqueda web.
                         )
 
                         if url and url not in urls_emitidas:
+
                             urls_emitidas.add(url)
 
                             yield sse(
@@ -327,9 +488,13 @@ verificadas sin acceso a búsqueda web.
                             )
 
                 elif tipo == "response.output_text.delta":
-                    delta = obtener_valor(event, "delta", "")
+
+                    delta = obtener_valor(
+                        event, "delta", ""
+                    )
 
                     if delta:
+
                         reporte_acumulado.append(delta)
 
                         yield sse(
@@ -340,49 +505,68 @@ verificadas sin acceso a búsqueda web.
                         )
 
                 elif tipo == "response.output_text.done":
+
                     yield sse(
                         "estado",
                         {
                             "etapa": "finalizando",
-                            "mensaje": "Sintetizando y organizando el reporte final..."
+                            "mensaje":
+                            "Sintetizando y organizando el reporte final..."
                         }
                     )
 
                 elif tipo == "response.completed":
+
                     yield sse(
                         "completado",
                         {
-                            "mensaje": "Investigación completada.",
-                            "reporte": "".join(reporte_acumulado),
-                            "total_fuentes": len(urls_emitidas)
+                            "mensaje":
+                            "Investigación completada.",
+                            "reporte":
+                            "".join(reporte_acumulado),
+                            "total_fuentes":
+                            len(urls_emitidas)
                         }
                     )
 
                 elif tipo == "error":
-                    mensaje = obtener_valor(
-                        event,
-                        "message",
-                        "OpenAI devolvió un error durante la investigación."
-                    )
 
                     yield sse(
                         "error",
                         {
-                            "mensaje": mensaje
+                            "mensaje":
+                            "OpenAI devolvió un error durante la investigación."
                         }
                     )
 
-        except Exception as error:
-            print("ERROR:", error)
+                elif tipo == "response.failed":
+
+                    yield sse(
+                        "error",
+                        {
+                            "mensaje":
+                            "La investigación no pudo completarse."
+                        }
+                    )
+
+            # Fin del procesamiento de eventos
+
+        except Exception:
+
+            app.logger.exception(
+                "Fallo la investigación"
+            )
 
             yield sse(
                 "error",
                 {
-                    "mensaje": "Ocurrió un error al realizar la investigación.",
-                    "detalle": str(error)
+                    "mensaje":
+                    "No se pudo completar la investigación. "
+                    "Inténtalo de nuevo más tarde."
                 }
             )
 
+    # Devolver el reporte en tiempo real
     return Response(
         generar(),
         mimetype="text/event-stream",
@@ -393,7 +577,9 @@ verificadas sin acceso a búsqueda web.
     )
 
 
+# Ejecutar servidor local
 if __name__ == "__main__":
+
     app.run(
         host="127.0.0.1",
         port=5000,

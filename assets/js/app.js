@@ -45,6 +45,32 @@ async function investigar() {
             }
         );
 
+        
+        // Comprobar errores que no sean eventos de OpenAI
+        const tipoRespuesta = (
+            respuesta.headers.get("content-type") || ""
+        ).toLowerCase();
+
+        if (
+            !respuesta.ok &&
+            !tipoRespuesta.includes("text/event-stream")
+        ) {
+
+            if (respuesta.status === 429) {
+                throw new Error(
+                    "Has realizado demasiadas peticiones " +
+                    "en poco tiempo. Espera unos minutos " +
+                    "antes de volver a intentarlo."
+                );
+            }
+
+            throw new Error(
+                "No se pudo realizar la investigación. " +
+                "Inténtalo nuevamente más tarde."
+            );
+        }
+
+
         if (!respuesta.body) {
             throw new Error(
                 "El navegador no pudo abrir el flujo de datos."
@@ -1118,13 +1144,24 @@ function obtenerDominio(url) {
 
 
 function mostrarError(mensaje) {
-    error.textContent = mensaje || "Ocurrió un error.";
+    const mensajeFinal = mensaje || "Ocurrió un error.";
+
+    error.textContent = mensajeFinal;
     error.classList.remove("d-none");
+    error.setAttribute("role", "alert");
 
     if (!actividad.classList.contains("d-none")) {
-        estadoActual.textContent = "La investigación se interrumpió.";
+        estadoActual.textContent =
+            "La investigación se interrumpió.";
     }
+
+    // Desplazar la pantalla hasta el aviso
+    error.scrollIntoView({
+        behavior: "smooth",
+        block: "center"
+    });
 }
+
 
 
 function escaparHTML(texto) {
